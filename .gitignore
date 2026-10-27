@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target
+target/
+**/*.rs.bk
+*.bk
+
+# SQLite database files
+*.db
+*.db-shm
+*.db-wal
+/data/
+
+# OS and Editor metadata
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
