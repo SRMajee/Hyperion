@@ -4,10 +4,8 @@ mod linux_impl {
     use io_uring::{cqueue, opcode, types, IoUring};
     use rusqlite::{params, Connection, OpenFlags};
     use std::env;
-    use std::net::SocketAddr;
-    use std::os::unix::io::{AsRawFd, RawFd};
+    use std::os::unix::io::RawFd;
     use std::sync::atomic::{fence, Ordering};
-    use std::sync::Arc;
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -159,7 +157,7 @@ mod linux_impl {
         worker_eventfds: Vec<RawFd>,
     ) {
         thread::spawn(move || {
-            let mut conn = Connection::open(&db_path).expect("Writer failed to open SQLite database");
+            let conn = Connection::open(&db_path).expect("Writer failed to open SQLite database");
             conn.execute_batch(
                 "PRAGMA journal_mode = WAL;
                  PRAGMA synchronous = NORMAL;
@@ -237,7 +235,6 @@ mod linux_impl {
                 }
                 let _ = conn.execute_batch("COMMIT;");
 
-                // Wake up all notified workers
                 let val: u64 = 1;
                 for &efd in &worker_eventfds {
                     unsafe {
@@ -314,7 +311,6 @@ mod linux_impl {
             println!("Worker {} pinned to CPU core {:?}", worker_id, core);
         }
 
-        // Each core opens its own read-only SQLite connection in WAL mode
         let read_conn = Connection::open_with_flags(
             &db_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -331,23 +327,26 @@ mod linux_impl {
             )
             .expect("Worker read connection pragma tuning failed");
 
-        // Try advanced io_uring flags with fallback
         let mut builder = IoUring::builder();
         builder.setup_single_issuer();
         builder.setup_coop_taskrun();
         builder.setup_defer_taskrun();
-        let mut ring = match builder.build(4096) {
-            Ok(r) => r,
-            Err(_) => {
-                eprintln!("Kernel does not support DEFER_TASKRUN, falling back to standard io_uring");
-                IoUring::builder().build(4096).expect("Failed to create io_uring")
-            }
+        let mut ring: IoUring<io_uring::squeue::Entry, io_uring::cqueue::Entry> =
+            match builder.build(4096) {
+                Ok(r) => r,
+                Err(_) => {
+                    eprintln!("Kernel does not support DEFER_TASKRUN, falling back to standard io_uring");
+                    IoUring::builder().build(4096).expect("Failed to create io_uring")
+                }
+            };
+
+        let mut buf_ring = {
+            let submitter = ring.submitter();
+            ProvidedBufRing::new(&submitter)
         };
 
-        let submitter = ring.submitter();
-        let mut buf_ring = ProvidedBufRing::new(&submitter);
+        let (submitter, mut sq, mut cq) = ring.split();
 
-        // Pre-allocate connection slab and write buffers for this core
         let mut conns: Vec<ConnState> = (0..MAX_CONNS_PER_THREAD).map(|_| ConnState::new()).collect();
         let mut write_buffers = vec![0u8; MAX_CONNS_PER_THREAD * WRITE_BUF_SIZE];
         for i in 0..MAX_CONNS_PER_THREAD {
@@ -355,7 +354,6 @@ mod linux_impl {
             conns[i].write_buf_ptr = unsafe { write_buffers.as_mut_ptr().add(i * WRITE_BUF_SIZE) };
         }
 
-        // Setup listener with SO_REUSEPORT
         let listener_fd = unsafe {
             let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0);
             assert!(fd >= 0, "Socket creation failed");
@@ -381,7 +379,7 @@ mod linux_impl {
             let accept_sqe = opcode::AcceptMulti::new(types::Fd(listener_fd))
                 .build()
                 .user_data(TOKEN_ACCEPT);
-            ring.submission().push(&accept_sqe).expect("Queue full");
+            let _ = sq.push(&accept_sqe);
         }
 
         let mut efd_buf = [0u8; 8];
@@ -389,204 +387,207 @@ mod linux_impl {
             let efd_sqe = opcode::Read::new(types::Fd(eventfd), efd_buf.as_mut_ptr(), 8)
                 .build()
                 .user_data(TOKEN_EVENTFD);
-            ring.submission().push(&efd_sqe).expect("Queue full");
+            let _ = sq.push(&efd_sqe);
         }
 
-        ring.submit().expect("Initial submit failed");
+        submitter.submit().expect("Initial submit failed");
 
         loop {
-            let _ = ring.submit_and_wait(1);
+            let _ = submitter.submit_and_wait(1);
 
             let mut cqe_rearm_accept = false;
             let mut cqe_rearm_eventfd = false;
 
-            {
-                let mut cq = ring.completion();
-                while let Some(cqe) = cq.next() {
-                    let udata = cqe.user_data();
-                    let res = cqe.result();
-                    let flags = cqe.flags();
+            while let Some(cqe) = cq.next() {
+                let udata = cqe.user_data();
+                let res = cqe.result();
+                let flags = cqe.flags();
 
-                    if udata == TOKEN_ACCEPT {
-                        if res >= 0 {
-                            let client_fd = res;
-                            if (client_fd as usize) < MAX_CONNS_PER_THREAD {
-                                let slot = client_fd as usize;
-                                conns[slot].fd = client_fd;
-                                conns[slot].state = 1;
+                if udata == TOKEN_ACCEPT {
+                    if res >= 0 {
+                        let client_fd = res;
+                        if (client_fd as usize) < MAX_CONNS_PER_THREAD {
+                            let slot = client_fd as usize;
+                            conns[slot].fd = client_fd;
+                            conns[slot].state = 1;
 
-                                unsafe {
-                                    let one: libc::c_int = 1;
-                                    libc::setsockopt(
-                                        client_fd,
-                                        libc::IPPROTO_TCP,
-                                        libc::TCP_NODELAY,
-                                        &one as *const _ as _,
-                                        4,
-                                    );
+                            unsafe {
+                                let one: libc::c_int = 1;
+                                libc::setsockopt(
+                                    client_fd,
+                                    libc::IPPROTO_TCP,
+                                    libc::TCP_NODELAY,
+                                    &one as *const _ as _,
+                                    4,
+                                );
 
-                                    let recv_sqe = opcode::RecvMulti::new(
-                                        types::Fd(client_fd),
-                                        BUF_GROUP_ID,
-                                    )
-                                    .build()
-                                    .user_data(TOKEN_RECV_MASK | (slot as u64));
+                                let recv_sqe = opcode::RecvMulti::new(
+                                    types::Fd(client_fd),
+                                    BUF_GROUP_ID,
+                                )
+                                .build()
+                                .user_data(TOKEN_RECV_MASK | (slot as u64));
 
-                                    let _ = ring.submission().push(&recv_sqe);
-                                }
-                            } else {
-                                unsafe { libc::close(client_fd); }
-                            }
-                        }
-                        if !cqueue::more(flags) {
-                            cqe_rearm_accept = true;
-                        }
-                    } else if udata == TOKEN_EVENTFD {
-                        cqe_rearm_eventfd = true;
-                    } else if (udata & TOKEN_RECV_MASK) == TOKEN_RECV_MASK {
-                        let slot = (udata & TOKEN_SLOT_MASK) as usize;
-                        if res <= 0 {
-                            if conns[slot].fd >= 0 {
-                                unsafe { libc::close(conns[slot].fd); }
-                                conns[slot].fd = -1;
-                                conns[slot].state = 0;
+                                let _ = sq.push(&recv_sqe);
                             }
                         } else {
-                            if let Some(bid) = cqueue::buffer_select(flags) {
-                                let slice = buf_ring.get_slice(bid, res as usize);
+                            unsafe { libc::close(client_fd); }
+                        }
+                    }
+                    if !cqueue::more(flags) {
+                        cqe_rearm_accept = true;
+                    }
+                } else if udata == TOKEN_EVENTFD {
+                    cqe_rearm_eventfd = true;
+                } else if (udata & TOKEN_RECV_MASK) == TOKEN_RECV_MASK {
+                    let slot = (udata & TOKEN_SLOT_MASK) as usize;
+                    if res <= 0 {
+                        if conns[slot].fd >= 0 {
+                            unsafe { libc::close(conns[slot].fd); }
+                            conns[slot].fd = -1;
+                            conns[slot].state = 0;
+                        }
+                    } else {
+                        if let Some(bid) = cqueue::buffer_select(flags) {
+                            let slice = buf_ring.get_slice(bid, res as usize);
 
-                                if let Some(id) = parse_get_record_id(slice) {
-                                    // PARTITIONED READ: Handled locally on this core!
-                                    let mut stmt = read_conn
-                                        .prepare_cached("SELECT payload, updated_at FROM records WHERE id = ?1")
-                                        .expect("Cached query prepare failed");
+                            if let Some(id) = parse_get_record_id(slice) {
+                                let mut stmt = read_conn
+                                    .prepare_cached("SELECT payload, updated_at FROM records WHERE id = ?1")
+                                    .expect("Cached query prepare failed");
 
-                                    let res_query = stmt.query_row(params![id], |row| {
-                                        let p: String = row.get(0)?;
-                                        let u: i64 = row.get(1)?;
-                                        Ok((p, u))
-                                    });
+                                let res_query = stmt.query_row(params![id], |row| {
+                                    let p: String = row.get(0)?;
+                                    let u: i64 = row.get(1)?;
+                                    Ok((p, u))
+                                });
 
-                                    let buf = conns[slot].write_buf_ptr;
-                                    match res_query {
-                                        Ok((p, u)) => {
-                                            let body_start_idx = 128;
-                                            unsafe {
-                                                let body_slice = std::slice::from_raw_parts_mut(buf.add(body_start_idx), 384);
-                                                let mut pos = 0;
-                                                let prefix = b"{\"id\":";
-                                                body_slice[pos..pos + prefix.len()].copy_from_slice(prefix);
-                                                pos += prefix.len();
+                                let buf = conns[slot].write_buf_ptr;
+                                match res_query {
+                                    Ok((p, u)) => {
+                                        let body_start_idx = 128;
+                                        unsafe {
+                                            let body_slice = std::slice::from_raw_parts_mut(buf.add(body_start_idx), 384);
+                                            let mut pos = 0;
+                                            let prefix = b"{\"id\":";
+                                            body_slice[pos..pos + prefix.len()].copy_from_slice(prefix);
+                                            pos += prefix.len();
 
-                                                pos += itoa::write(&mut body_slice[pos..], id).unwrap_or(0);
+                                            let mut itoa_b = itoa::Buffer::new();
+                                            let id_str = itoa_b.format(id);
+                                            body_slice[pos..pos + id_str.len()].copy_from_slice(id_str.as_bytes());
+                                            pos += id_str.len();
 
-                                                let p_mid = b",\"payload\":\"";
-                                                body_slice[pos..pos + p_mid.len()].copy_from_slice(p_mid);
-                                                pos += p_mid.len();
+                                            let p_mid = b",\"payload\":\"";
+                                            body_slice[pos..pos + p_mid.len()].copy_from_slice(p_mid);
+                                            pos += p_mid.len();
 
-                                                let p_bytes = p.as_bytes();
-                                                let p_len = p_bytes.len().min(256);
-                                                body_slice[pos..pos + p_len].copy_from_slice(&p_bytes[..p_len]);
-                                                pos += p_len;
+                                            let p_bytes = p.as_bytes();
+                                            let p_len = p_bytes.len().min(256);
+                                            body_slice[pos..pos + p_len].copy_from_slice(&p_bytes[..p_len]);
+                                            pos += p_len;
 
-                                                let u_mid = b"\",\"updated_at\":";
-                                                body_slice[pos..pos + u_mid.len()].copy_from_slice(u_mid);
-                                                pos += u_mid.len();
+                                            let u_mid = b"\",\"updated_at\":";
+                                            body_slice[pos..pos + u_mid.len()].copy_from_slice(u_mid);
+                                            pos += u_mid.len();
 
-                                                pos += itoa::write(&mut body_slice[pos..], u).unwrap_or(0);
+                                            let mut itoa_b2 = itoa::Buffer::new();
+                                            let u_str = itoa_b2.format(u);
+                                            body_slice[pos..pos + u_str.len()].copy_from_slice(u_str.as_bytes());
+                                            pos += u_str.len();
 
-                                                body_slice[pos] = b'}';
-                                                pos += 1;
-                                                let body_len = pos;
+                                            body_slice[pos] = b'}';
+                                            pos += 1;
+                                            let body_len = pos;
 
-                                                let mut h_pos = 0;
-                                                let header_prefix = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: keep-alive\r\nContent-Length: ";
-                                                let h_slice = std::slice::from_raw_parts_mut(buf, 128);
-                                                h_slice[h_pos..h_pos + header_prefix.len()].copy_from_slice(header_prefix);
-                                                h_pos += header_prefix.len();
+                                            let mut h_pos = 0;
+                                            let header_prefix = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: keep-alive\r\nContent-Length: ";
+                                            let h_slice = std::slice::from_raw_parts_mut(buf, 128);
+                                            h_slice[h_pos..h_pos + header_prefix.len()].copy_from_slice(header_prefix);
+                                            h_pos += header_prefix.len();
 
-                                                h_pos += itoa::write(&mut h_slice[h_pos..], body_len).unwrap_or(0);
+                                            let mut itoa_b3 = itoa::Buffer::new();
+                                            let bl_str = itoa_b3.format(body_len);
+                                            h_slice[h_pos..h_pos + bl_str.len()].copy_from_slice(bl_str.as_bytes());
+                                            h_pos += bl_str.len();
 
-                                                h_slice[h_pos..h_pos + 4].copy_from_slice(b"\r\n\r\n");
-                                                h_pos += 4;
+                                            h_slice[h_pos..h_pos + 4].copy_from_slice(b"\r\n\r\n");
+                                            h_pos += 4;
 
-                                                std::ptr::copy(buf.add(body_start_idx), buf.add(h_pos), body_len);
-                                                let total_len = h_pos + body_len;
+                                            std::ptr::copy(buf.add(body_start_idx), buf.add(h_pos), body_len);
+                                            let total_len = h_pos + body_len;
 
-                                                let send_sqe = opcode::Send::new(
-                                                    types::Fd(conns[slot].fd),
-                                                    buf,
-                                                    total_len as u32,
-                                                )
-                                                .build()
-                                                .user_data(TOKEN_SEND_MASK | (slot as u64));
-                                                let _ = ring.submission().push(&send_sqe);
-                                            }
-                                        }
-                                        Err(_) => {
-                                            let resp = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
-                                            unsafe {
-                                                std::ptr::copy_nonoverlapping(resp.as_ptr(), buf, resp.len());
-                                                let send_sqe = opcode::Send::new(
-                                                    types::Fd(conns[slot].fd),
-                                                    buf,
-                                                    resp.len() as u32,
-                                                )
-                                                .build()
-                                                .user_data(TOKEN_SEND_MASK | (slot as u64));
-                                                let _ = ring.submission().push(&send_sqe);
-                                            }
+                                            let send_sqe = opcode::Send::new(
+                                                types::Fd(conns[slot].fd),
+                                                buf,
+                                                total_len as u32,
+                                            )
+                                            .build()
+                                            .user_data(TOKEN_SEND_MASK | (slot as u64));
+                                            let _ = sq.push(&send_sqe);
                                         }
                                     }
-                                } else if let Some(payload_slice) = parse_post_payload(slice) {
-                                    // ROUTED WRITE: Sent to dedicated writer thread
-                                    let mut pbuf = [0u8; 256];
-                                    let len = payload_slice.len().min(256);
-                                    pbuf[..len].copy_from_slice(&payload_slice[..len]);
-
-                                    let _ = tx_write.send(WriteRequest {
-                                        worker_id,
-                                        slot: slot as u32,
-                                        fd: conns[slot].fd,
-                                        payload_len: len,
-                                        payload: pbuf,
-                                    });
-                                } else {
-                                    let ptr = conns[slot].write_buf_ptr;
-                                    let resp = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
-                                    unsafe {
-                                        std::ptr::copy_nonoverlapping(resp.as_ptr(), ptr, resp.len());
-                                        let send_sqe = opcode::Send::new(
-                                            types::Fd(conns[slot].fd),
-                                            ptr,
-                                            resp.len() as u32,
-                                        )
-                                        .build()
-                                        .user_data(TOKEN_SEND_MASK | (slot as u64));
-                                        let _ = ring.submission().push(&send_sqe);
+                                    Err(_) => {
+                                        let resp = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+                                        unsafe {
+                                            std::ptr::copy_nonoverlapping(resp.as_ptr(), buf, resp.len());
+                                            let send_sqe = opcode::Send::new(
+                                                types::Fd(conns[slot].fd),
+                                                buf,
+                                                resp.len() as u32,
+                                            )
+                                            .build()
+                                            .user_data(TOKEN_SEND_MASK | (slot as u64));
+                                            let _ = sq.push(&send_sqe);
+                                        }
                                     }
                                 }
+                            } else if let Some(payload_slice) = parse_post_payload(slice) {
+                                let mut pbuf = [0u8; 256];
+                                let len = payload_slice.len().min(256);
+                                pbuf[..len].copy_from_slice(&payload_slice[..len]);
 
-                                buf_ring.replenish(bid);
-                            }
-
-                            if !cqueue::more(flags) && conns[slot].fd >= 0 {
+                                let _ = tx_write.send(WriteRequest {
+                                    worker_id,
+                                    slot: slot as u32,
+                                    fd: conns[slot].fd,
+                                    payload_len: len,
+                                    payload: pbuf,
+                                });
+                            } else {
+                                let ptr = conns[slot].write_buf_ptr;
+                                let resp = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
                                 unsafe {
-                                    let recv_sqe = opcode::RecvMulti::new(
+                                    std::ptr::copy_nonoverlapping(resp.as_ptr(), ptr, resp.len());
+                                    let send_sqe = opcode::Send::new(
                                         types::Fd(conns[slot].fd),
-                                        BUF_GROUP_ID,
+                                        ptr,
+                                        resp.len() as u32,
                                     )
                                     .build()
-                                    .user_data(TOKEN_RECV_MASK | (slot as u64));
-                                    let _ = ring.submission().push(&recv_sqe);
+                                    .user_data(TOKEN_SEND_MASK | (slot as u64));
+                                    let _ = sq.push(&send_sqe);
                                 }
+                            }
+
+                            buf_ring.replenish(bid);
+                        }
+
+                        if !cqueue::more(flags) && conns[slot].fd >= 0 {
+                            unsafe {
+                                let recv_sqe = opcode::RecvMulti::new(
+                                    types::Fd(conns[slot].fd),
+                                    BUF_GROUP_ID,
+                                )
+                                .build()
+                                .user_data(TOKEN_RECV_MASK | (slot as u64));
+                                let _ = sq.push(&recv_sqe);
                             }
                         }
                     }
                 }
             }
 
-            // Drain write responses for this worker
             while let Ok(resp) = rx_write_resp.try_recv() {
                 let s = resp.slot as usize;
                 if conns[s].fd == resp.fd && resp.fd >= 0 {
@@ -599,7 +600,10 @@ mod linux_impl {
                             body_slice[pos..pos + prefix.len()].copy_from_slice(prefix);
                             pos += prefix.len();
 
-                            pos += itoa::write(&mut body_slice[pos..], resp.id).unwrap_or(0);
+                            let mut itoa_b = itoa::Buffer::new();
+                            let id_str = itoa_b.format(resp.id);
+                            body_slice[pos..pos + id_str.len()].copy_from_slice(id_str.as_bytes());
+                            pos += id_str.len();
 
                             body_slice[pos] = b'}';
                             pos += 1;
@@ -611,7 +615,10 @@ mod linux_impl {
                             h_slice[h_pos..h_pos + header_prefix.len()].copy_from_slice(header_prefix);
                             h_pos += header_prefix.len();
 
-                            h_pos += itoa::write(&mut h_slice[h_pos..], body_len).unwrap_or(0);
+                            let mut itoa_b2 = itoa::Buffer::new();
+                            let bl_str = itoa_b2.format(body_len);
+                            h_slice[h_pos..h_pos + bl_str.len()].copy_from_slice(bl_str.as_bytes());
+                            h_pos += bl_str.len();
 
                             h_slice[h_pos..h_pos + 4].copy_from_slice(b"\r\n\r\n");
                             h_pos += 4;
@@ -626,7 +633,7 @@ mod linux_impl {
                             )
                             .build()
                             .user_data(TOKEN_SEND_MASK | (s as u64));
-                            let _ = ring.submission().push(&send_sqe);
+                            let _ = sq.push(&send_sqe);
                         }
                     } else {
                         let resp_bytes = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
@@ -639,7 +646,7 @@ mod linux_impl {
                             )
                             .build()
                             .user_data(TOKEN_SEND_MASK | (s as u64));
-                            let _ = ring.submission().push(&send_sqe);
+                            let _ = sq.push(&send_sqe);
                         }
                     }
                 }
@@ -650,7 +657,7 @@ mod linux_impl {
                     let accept_sqe = opcode::AcceptMulti::new(types::Fd(listener_fd))
                         .build()
                         .user_data(TOKEN_ACCEPT);
-                    let _ = ring.submission().push(&accept_sqe);
+                    let _ = sq.push(&accept_sqe);
                 }
             }
 
@@ -659,7 +666,7 @@ mod linux_impl {
                     let efd_sqe = opcode::Read::new(types::Fd(eventfd), efd_buf.as_mut_ptr(), 8)
                         .build()
                         .user_data(TOKEN_EVENTFD);
-                    let _ = ring.submission().push(&efd_sqe);
+                    let _ = sq.push(&efd_sqe);
                 }
             }
         }
@@ -678,7 +685,6 @@ mod linux_impl {
 
         println!("Initializing Phase 3 Kernel Unleashed (Multi-Core Thread-Per-Core SO_REUSEPORT)...");
 
-        // Seed initial DB table
         {
             let conn = Connection::open(&db_path)?;
             conn.execute_batch(
