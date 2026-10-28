@@ -29,6 +29,9 @@ struct Args {
 
     #[arg(long, default_value_t = 10)]
     write_ratio: u32,
+
+    #[arg(long, default_value_t = 0)]
+    pacing_ms: u64,
 }
 
 struct Stats {
@@ -73,6 +76,7 @@ async fn run_connection_worker(
     target_addr: SocketAddr,
     source_ip: Option<IpAddr>,
     write_ratio: u32,
+    pacing_ms: u64,
     end_time: Instant,
     stats: Arc<Stats>,
 ) {
@@ -179,6 +183,9 @@ async fn run_connection_worker(
                     stats.total_requests.fetch_add(1, Ordering::Relaxed);
                     if let Ok(mut h) = stats.histograms.try_lock() {
                         let _ = h.record(latency_us);
+                    }
+                    if pacing_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(pacing_ms)).await;
                     }
                 }
                 _ => {
@@ -301,8 +308,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         };
         let s = stats.clone();
+        let pacing = args.pacing_ms;
         tokio::spawn(async move {
-            run_connection_worker(target, sip, args.write_ratio, end_time, s).await;
+            run_connection_worker(target, sip, args.write_ratio, pacing, end_time, s).await;
         });
 
         if spawn_delay > Duration::from_micros(10) {

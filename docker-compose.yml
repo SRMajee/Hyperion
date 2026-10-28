@@ -154,10 +154,87 @@ services:
       hyperion-net:
         ipv4_address: 172.28.0.10
 
+  # ============================================================================
+  # PHASE 4: Kernel Bypass (AF_XDP / Raw Packet Engine & User-Space Micro-TCP)
+  # ============================================================================
+  phase4-server:
+    build:
+      context: .
+      dockerfile: docker/phase4/Dockerfile
+    container_name: hyperion-phase4-server
+    profiles: [phase4-hold, phase4-blast]
+    env_file: [docker/phase4/.env.phase4]
+    cpus: "2.0"
+    mem_limit: "4g"
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_ADMIN
+      - SYS_RESOURCE
+    security_opt:
+      - seccomp:unconfined
+    ulimits:
+      memlock: -1
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    volumes:
+      - phase4-db-data:/data
+    ports:
+      - "8084:80"
+    networks:
+      hyperion-net:
+        ipv4_address: 172.28.0.2
+
+  load-tester-phase4-hold:
+    build:
+      context: .
+      dockerfile: docker/load-tester/Dockerfile
+    container_name: hyperion-load-tester-phase4-hold
+    profiles: [phase4-hold]
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - phase4-server
+    command: >
+      /app/load-tester
+      --target http://172.28.0.2:80
+      --concurrency 600000
+      --duration 60
+      --ramp-up 20
+      --pacing-ms 1000
+      --ips 172.28.0.10,172.28.0.11,172.28.0.12,172.28.0.13,172.28.0.14,172.28.0.15,172.28.0.16,172.28.0.17,172.28.0.18,172.28.0.19,172.28.0.20,172.28.0.21,172.28.0.22,172.28.0.23,172.28.0.24,172.28.0.25,172.28.0.26,172.28.0.27,172.28.0.28,172.28.0.29
+    networks:
+      hyperion-net:
+        ipv4_address: 172.28.0.10
+
+  load-tester-phase4-blast:
+    build:
+      context: .
+      dockerfile: docker/load-tester/Dockerfile
+    container_name: hyperion-load-tester-phase4-blast
+    profiles: [phase4-blast]
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - phase4-server
+    command: >
+      /app/load-tester
+      --target http://172.28.0.2:80
+      --concurrency 65000
+      --duration 45
+      --ramp-up 10
+      --pacing-ms 0
+      --ips 172.28.0.10,172.28.0.11,172.28.0.12,172.28.0.13,172.28.0.14,172.28.0.15,172.28.0.16,172.28.0.17,172.28.0.18,172.28.0.19
+    networks:
+      hyperion-net:
+        ipv4_address: 172.28.0.10
+
 volumes:
   phase1-db-data:
   phase2-db-data:
   phase3-db-data:
+  phase4-db-data:
 
 networks:
   hyperion-net:

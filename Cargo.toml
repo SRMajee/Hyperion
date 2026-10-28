@@ -4,6 +4,7 @@ members = [
     "crates/phase1-axum-baseline",
     "crates/phase2-iouring-max",
     "crates/phase3-kernel-unleashed",
+    "crates/phase4-kernel-bypass",
     "crates/load-tester",
 ]
 

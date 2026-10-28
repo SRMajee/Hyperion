@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -e
 
-echo "[Load Tester] Configuring 10 Virtual Secondary IPs (172.28.0.10 - 172.28.0.19)..."
+echo "[Load Tester] Configuring 20 Virtual Secondary IPs (172.28.0.10 - 172.28.0.29)..."
 
 IFACE="eth0"
 
-for i in $(seq 10 19); do
+for i in $(seq 10 29); do
     ip addr add 172.28.0.$i/16 dev $IFACE 2>/dev/null || true
 done
 

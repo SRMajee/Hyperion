@@ -11,6 +11,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/phase1-axum-baseline ./crates/phase1-axum-baseline
 COPY crates/phase2-iouring-max ./crates/phase2-iouring-max
 COPY crates/phase3-kernel-unleashed ./crates/phase3-kernel-unleashed
+COPY crates/phase4-kernel-bypass ./crates/phase4-kernel-bypass
 COPY crates/load-tester ./crates/load-tester
 
 RUN cargo build --release -p load-tester
